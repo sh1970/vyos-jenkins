@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+from datetime import datetime
 import logging
 import os.path
 from shlex import quote
 from time import time, monotonic
-
-import pendulum
 
 from lib.apt import Apt
 from lib.cache import Cache
@@ -13,7 +12,9 @@ from lib.debranding import Debranding
 from lib.docker import Docker
 from lib.git import Git
 from lib.github import GitHub
-from lib.helpers import setup_logging, ProcessException, refuse_root, get_my_log_file, data_dir, build_dir, scripts_dir
+from lib.helpers import setup_logging, ProcessException, refuse_root, get_my_log_file, data_dir, build_dir, scripts_dir, \
+    quote_all
+from lib.scripting import Scripting
 
 
 class PackageBuilder:
@@ -24,7 +25,7 @@ class PackageBuilder:
     docker = None
 
     def __init__(self, branch, single_package, dirty_build, ignore_missing_binaries, skip_build, skip_apt,
-                 force_build, vyos_build_docker, debranding: Debranding):
+                 force_build, vyos_build_docker, rescan_packages, pre_build_hook, debranding: Debranding):
         self.branch = branch
         self.single_package = single_package
         self.dirty_build = dirty_build
@@ -33,10 +34,13 @@ class PackageBuilder:
         self.skip_apt = skip_apt
         self.force_build = force_build
         self.vyos_build_docker = vyos_build_docker
+        self.rescan_packages = rescan_packages
+        self.pre_build_hook = pre_build_hook
         self.debranding = debranding
 
         self.github = GitHub()
         self.cache = Cache(os.path.join(data_dir, "builder-cache-%s.json" % self.branch), dict, {})
+        self.scripting = Scripting()
 
     def build(self):
         begin = monotonic()
@@ -129,18 +133,30 @@ class PackageBuilder:
 
         self.debranding.remove_package_branding(repo_path, package["package_name"])
 
+        if self.pre_build_hook:
+            self.scripting.run(self.pre_build_hook, repo_path, vars={
+                "BRANCH": self.branch,
+                "PACKAGE_NAME": package["package_name"],
+            })
+
+        virtual_scripts = "/my-build-scripts"
         if package["build_type"] == "build.py":
             my_directory = os.path.join(self.my_build_dir, "vyos-build", package["path"])
             if not self.skip_build or new:
                 # It's important to run bash in interactive mode, non-interactive shell breaks dependency on .bashrc.
-                # It's also required to call python explicitly since some scripts don't have correct shebang.
-                self.docker.run("bash -i -c 'python3 ./build.py'", work_dir="/vyos/%s" % package["path"])
+                build_script = os.path.join(virtual_scripts, "build_py.sh")
+                vyos_dir = "/vyos/%s" % package["path"]
+                self.docker.run(
+                    "bash -i -c '%s %s'" % quote_all(build_script, package["package_name"]),
+                    work_dir=vyos_dir,
+                    extra_mounts=[
+                        (scripts_dir, virtual_scripts)
+                    ],
+                )
 
         elif package["build_type"] == "dpkg-buildpackage":
             my_directory = os.path.join(self.my_build_dir, repo_name)
             virtual_dir = "/vyos-%s" % package["package_name"]
-
-            virtual_scripts = "%s-scripts" % virtual_dir
 
             build_script = "generic-build-script.sh"
             custom_build_script = os.path.join(scripts_dir, "%s.sh" % package["package_name"])
@@ -181,7 +197,7 @@ class PackageBuilder:
         packages_timestamp = self.cache.get("packages_timestamp")
         packages = self.cache.get("packages")
 
-        if not packages_timestamp or not packages or packages_timestamp <= time() - 3600 * 24:
+        if not packages_timestamp or not packages or packages_timestamp <= time() - 3600 * 24 or self.rescan_packages:
             logging.info("Fetching vyos repository list")
             repositories = self.github.find_repositories("org", "vyos")
 
@@ -192,7 +208,7 @@ class PackageBuilder:
             self.cache.set("packages", packages)
 
         else:
-            date = pendulum.from_timestamp(float(packages_timestamp)).in_tz("local").format("YYYY-MM-DD HH:mm:ss")
+            date = datetime.fromtimestamp(float(packages_timestamp)).astimezone().strftime("%Y-%m-%d %H:%M:%S")
             logging.info("Using previously generated package metadata (%s)" % date)
 
         return packages
@@ -215,8 +231,12 @@ if __name__ == "__main__":
         parser.add_argument("--skip-build", action="store_true")
         parser.add_argument("--skip-apt", action="store_true")
         parser.add_argument("--force-build", action="store_true")
+        parser.add_argument("--rescan-packages", action="store_true")
         parser.add_argument("--vyos-build-docker", default="vyos/vyos-build",
                             help="Default option uses vyos/vyos-build from dockerhub")
+        scripting_info = "the current working directory is the repo of given package"
+        scripting_info += ", available environment variables: VYOS_BUILD_BRANCH, VYOS_BUILD_PACKAGE_NAME"
+        parser.add_argument("--pre-build-hook", help="Script to execute before build, %s" % scripting_info)
 
         debranding.populate_cli_parser(parser)
 
